@@ -1,7 +1,8 @@
-
 # control/on_road_mode.py
 # -*- coding: utf-8 -*-
 
+import threading
+import state
 import time
 import can
 import RPi.GPIO as GPIO
@@ -9,28 +10,14 @@ import board
 import busio
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
-from canbus.can_utils import can_bus_correction
+#from canbus.can_utils import can_bus_correction
 import subprocess
-
-# ---------- CONSTANTS ----------
-
-MAX_RPM = 1500
-ROTARY_MAX_RPM = 1200
-LONG_PRESS_RPM = base_rpm
-
-LONG_PRESS_TIME = 0.2      # seconds to consider as long press
-DOUBLE_PRESS_GAP = 0.40    # max time between taps for double press
-SEND_PERIOD = 0.02          # periodic CAN refresh (10 Hz)
-
-# Twirl pattern (both motors)
-STEP_TIMES = [3.0, 8, 0.2, 0.2, 0.2]
-L_STEPS = [(300, 300), (300, 100), (0, 0), (0, 0), (0, 0)]
-R_STEPS = [(300, 300), (100, 300), (0, 0), (0, 0), (0, 0)]
+from control.motor_manager import MotorManager
 
 # Feedback assist
 RE_ALIGN_RPM_REDUCTION = 100   # how much to trim the faster motor
 FEEDBACK_TOLERANCE = 50        # acceptable RPM difference before correcting
-LOW_RPM_FEEDBACK_OFF = 300     # <--- ignore feedback below this RPM
+LOW_RPM_FEEDBACK_OFF = 300     # <--- ignore feedback below
 
 # ---------- GPIO ----------
 LEFT_BTN_PIN = 26
@@ -51,406 +38,434 @@ GPIO.setup(SAFETY_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
 bus = can.interface.Bus(channel='can0', interface='socketcan')
 
 # ---------- STATE ----------
-MODE_IDLE = 0
-MODE_SINGLE_LEFT = 1
-MODE_SINGLE_RIGHT = 2
-MODE_TWIRL_LEFT = 3
-MODE_TWIRL_RIGHT = 4
-
-mode = MODE_IDLE
-
-direction_btn_last_state = False  # Was LOW
-current_direction = 0x01  # 0x01 = forward, 0x02 = reverse
-last_direction_toggle = 0.0
-DIRECTION_DEBOUNCE = 0.3  # seconds
-
-left_pressed = False
-right_pressed = False
-left_press_start = 0.0
-right_press_start = 0.0
-left_last_rise = 0.0
-right_last_rise = 0.0
-
-twirl_step = 0
-twirl_step_start = 0.0
-
-last_send_time = 0.0
-
-feedbackRPM_Left = 0
-feedbackRPM_Right = 0
-
 
 # ---------- ADS1115 ----------
 i2c = busio.I2C(board.SCL, board.SDA)
 ads = ADS.ADS1115(i2c)
-throttle_channel = AnalogIn(ads, ADS.P0)  # Assuming throttle on A0
+throttle_channel = AnalogIn(ads, ADS.P0)
 rotary_throttle_channel = AnalogIn(ads, ADS.P1)
 
-# ---------- CAN Reset ----------
-import os, time, can, subprocess
-
-def reset_can_interface():
-    """
-    Reset CAN interface and return a new bus object.
-    """
-    try:
-        print("?? Resetting can0 with bitrate 250000...")
-        subprocess.run(["sudo", "ip", "link", "set", "can0", "down"], check=False)
-
-        # small pause before setting up again
-        time.sleep(0.3)
-
-        result = subprocess.run(
-            ["sudo", "ip", "link", "set", "can0", "up", "type", "can", "bitrate", "250000"],
-            capture_output=True, text=True
-        )
-
-        if result.returncode != 0:
-            print(f"? Failed to bring can0 up: {result.stderr.strip()}")
-            return None
-
-        # give kernel a moment before binding
-        time.sleep(0.5)
-
-        print("? can0 reset successful, reconnecting bus...")
-        new_bus = can.interface.Bus(channel="can0", bustype="socketcan")
-        return new_bus
-
-    except Exception as e:
-        print(f"? CAN reset error: {e}")
-        return None
-
-# ---------- Safe Send (TX spacing) ----------
-_last_send_tick = 0.0
-def safe_send(msg, min_interval=0.005):
-    """
-    Send CAN frame with minimal spacing to avoid 'No buffer space available' (Err 105).
-    """
-    global _last_send_tick, bus
-    now = time.time()
-    gap = now - _last_send_tick
-    if gap < min_interval:
-        time.sleep(min_interval - gap)
-
-    try:
-        bus.send(msg, timeout=0.01)
-    except can.CanError as e:
-        if "No buffer space available" in str(e):
-            reset_can_interface()
-        else:
-            print(f"Motor send failed: {e}")
-        raise
-    _last_send_tick = time.time()
-
-# ---------- Feedback ----------
-def read_feedback():
-    global feedbackRPM_Left, feedbackRPM_Right
-    try:
-        msg = bus.recv(timeout=0.0)
-        if msg is None:
-            return
-        recvId = msg.arbitration_id
-        buf = msg.data
-        if (recvId & 0xFF) == 0x05:
-            feedbackRPM_Left = buf[0] | (buf[1] << 8)
-            #print("Left feedbackRPM",feedbackRPM_Left) 
-        elif (recvId & 0xFF) == 0x06:
-            feedbackRPM_Right = buf[0] | (buf[1] << 8)
-            #ACAprint("Right feedbackRPM",feedbackRPM_Right) 
-    except Exception as e:
-        print(f"Feedback read failed: {e}")
-
-
-# ---------- Helpers ----------
 def adc_to_rpm(value):
-    rpm = int((value / 36535) * MAX_RPM)
-    #print("given RMP",rpm )
-    return max(0, min(rpm, MAX_RPM))
+    """Convert ADC throttle value to RPM (clamped)."""
+    rpm = int((value / 36535) * state.MAX_RPM_ON_ROAD)  # use ON_ROAD limit
+    return max(0, min(rpm, state.MAX_RPM_ON_ROAD))
 
 def is_twirl_mode_enabled():
-    return GPIO.input(MODE_SWITCH_PIN) == GPIO.HIGH
-
-def send_can_message(bus_obj, msg):
-    """
-    Wrapper to send CAN messages with auto-recovery.
-    """
-    try:
-        safe_send(msg)
-
-    except can.CanError as e:
-        if "No buffer space available" in str(e) or "Network is down" in str(e):
-            new_bus = reset_can_interface()
-            if new_bus:
-                bus = new_bus   # swap in the fixed bus
-                try:
-                    bus.send(msg, timeout=0.01)  # retry once
-                except can.CanError as e2:
-                    print(f"Retry after reset failed: {e2}")
-        else:
-            print(f"Motor send failed: {e}")
-
-        return bus_obj
-    return bus_obj
+    """Check if mode switch is ON (Twirl enabled)."""
+    return GPIO.input(state.MODE_SWITCH_PIN) == GPIO.HIGH
 
 def toggle_direction():
-    global current_direction
-    current_direction = 0x02 if current_direction == 0x01 else 0x01
-    print("Direction set to", "REVERSE" if current_direction == 0x02 else "FORWARD")
+    """Safely toggle drive direction."""
+    state.current_direction = (
+        0x02 if state.current_direction == 0x01 else 0x01
+    )
+    print(
+        "Direction set to",
+        "REVERSE" if state.current_direction == 0x02 else "FORWARD"
+    )
 
-def build_can_data(rpm, direction):
-    rpm = max(0, min(int(rpm), MAX_RPM))
-    return [
-        rpm & 0xFF,
-        (rpm >> 8) & 0xFF,
-        0x01,          # enable
-        direction,     # 0x01 forward, 0x02 reverse, 0x00 stop
-        0x00, 0x00, 0x00, 0x00
-    ]
-
-def build_rotary_can_data(rpm, direction):
-    rpm = max(0, min(int(rpm), ROTARY_MAX_RPM))
-    return [
-        rpm & 0xFF,
-        (rpm >> 8) & 0xFF,
-        0x01,
-        direction,
-        0x00, 0x00, 0x00, 0x00
-    ]
-
-def send_rotary_motor_rpm(rpm, direction):
-    """Send one frame to rotary motor (ID=4)."""
-    try:
-        arbitration_id = 0x0CF10000 | (0x05 << 8) | 0x1E
-        msg = can.Message(
-            arbitration_id=arbitration_id,
-            is_extended_id=True,
-            data=build_rotary_can_data(rpm, direction)
-        )
-        safe_send(msg)
-    except can.CanError as e:
-        if "No buffer space available" in str(e) or "Network is down" in str(e):
-            new_bus = reset_can_interface()
-            if new_bus:
-                bus = new_bus   # swap in the fixed bus
-                try:
-                    bus.send(msg, timeout=0.01)  # retry once
-                except can.CanError as e2:
-                    print(f"Retry after reset failed: {e2}")
-        else:
-            print(f"Motor send failed: {e}")
-
-def rotary_motor_stop():
-    """Hard stop rotary motor."""
-    send_rotary_motor_rpm(0, 0x00)
-
-def send_motor_rpm_with_dir(rpm_left, rpm_right, direction):
-    """Send one frame to each motor."""
-    try:
-        id_left = 0x0CF10000 | (0x06 << 8) | 0x1E
-        id_right = 0x0CF10000 | (0x04 << 8) | 0x1E
-        safe_send(can.Message(arbitration_id=id_left,  is_extended_id=True, data=build_can_data(rpm_left,  direction)))
-        safe_send(can.Message(arbitration_id=id_right, is_extended_id=True, data=build_can_data(rpm_right, direction)))
-    except can.CanError as e:
-        if "No buffer space available" in str(e):
-            reset_can_interface()
-        else:
-            print(f"Motor send failed: {e}")
-
-def safe_stop():
-    """Stop both motors once."""
-    try:
-        send_motor_rpm_with_dir(0, 0, 0x00)
-    except Exception:
-        pass
-
-# ---------- Twirl ----------
 def begin_twirl(left: bool):
-    global mode, twirl_step, twirl_step_start
-    if not is_twirl_mode_enabled():
-        print("Twirl blocked: Mode switch is OFF")
-        return
-    mode = MODE_TWIRL_LEFT if left else MODE_TWIRL_RIGHT
-    twirl_step = 1
-    twirl_step_start = time.monotonic()
+    """Start twirl sequence (LEFT or RIGHT)."""
+    # if not is_twirl_mode_enabled():
+    #     print("Twirl blocked: Mode switch is OFF")
+    #     return
+    state.mode = state.MODE_TWIRL_LEFT if left else state.MODE_TWIRL_RIGHT
+    state.twirl_step = 1
+    state.twirl_step_start = time.monotonic()
     print(f"Twirl {'LEFT' if left else 'RIGHT'} started")
 
-def execute_twirl(now):
-    global mode, twirl_step, twirl_step_start
-    steps = L_STEPS if mode == MODE_TWIRL_LEFT else R_STEPS
+def execute_twirl(now, motor_manager):
+    """Run twirl sequence step-by-step."""
+    mode = state.mode
+    twirl_step = state.twirl_step
+    twirl_step_start = state.twirl_step_start
+    current_direction = state.current_direction
+
+    steps = state.L_STEPS if mode == state.MODE_TWIRL_LEFT else state.R_STEPS
+
     if 1 <= twirl_step <= len(steps):
         rpm_left, rpm_right = steps[twirl_step - 1]
-        send_motor_rpm_with_dir(rpm_left, rpm_right, current_direction)
-        if now - twirl_step_start > STEP_TIMES[twirl_step - 1]:
-            twirl_step += 1
-            twirl_step_start = now
+
+        # Apply motor command
+        motor_manager.set_wheels(rpm_left, rpm_right, current_direction)
+
+        if now - twirl_step_start > state.STEP_TIMES[twirl_step - 1]:
+            state.twirl_step += 1
+            state.twirl_step_start = now
     else:
-        mode = MODE_IDLE
-        twirl_step = 0
+        state.mode = state.MODE_IDLE
+        state.twirl_step = 0
         print("Twirl completed")
-        safe_stop()
+        safe_stop(motor_manager)
+        
+def apply_gradient(target, current, slew_rate):
+    if target > current + slew_rate:
+        return current + slew_rate
+    elif target < current - slew_rate:
+        return current - slew_rate
+    else:
+        return target
 
-# ---------- Buttons (YOUR ORIGINAL FUNCTION) ----------
-def handle_button_edges(now):
-    """Detect button presses and update mode."""
-    global left_pressed, right_pressed
-    global left_press_start, right_press_start
-    global left_last_rise, right_last_rise
-    global mode
+def periodic_drive(now, motor_manager):
+    """Periodic drive loop for wheels updates motor_manager (does NOT send directly)."""
 
-    # -------- LEFT BUTTON --------
-    left_now = GPIO.input(LEFT_BTN_PIN) == GPIO.HIGH
+    # Persistent storage of last RPMs
+    if not hasattr(state, "last_left_rpm"):
+        state.last_left_rpm = 0
+    if not hasattr(state, "last_right_rpm"):
+        state.last_right_rpm = 0
 
-    if left_now and not left_pressed:  # Rising edge
-        if (now - left_last_rise) <= DOUBLE_PRESS_GAP:
-            begin_twirl(left=True)
-        else:
-            left_press_start = now
-        left_last_rise = now
-        left_pressed = True
+    RPM_SLEW_RATE = state.RPM_SLEW_RATE  # max RPM change per cycle
 
-    if left_now and left_pressed:
-        if mode in (MODE_IDLE, MODE_SINGLE_LEFT, MODE_SINGLE_RIGHT):
-            if (now - left_press_start) >= LONG_PRESS_TIME and mode != MODE_SINGLE_LEFT:
-                mode = MODE_SINGLE_LEFT
-                #ramp_motor(target_rpm=300)
-                print("Single LEFT started")
-
-    if not left_now and left_pressed:  # Release
-        if mode == MODE_SINGLE_LEFT:
-            safe_stop()
-            mode = MODE_IDLE
-            print("Single LEFT stopped")
-        left_pressed = False
-
-    # -------- RIGHT BUTTON --------
-    right_now = GPIO.input(RIGHT_BTN_PIN) == GPIO.HIGH
-
-    if right_now and not right_pressed:
-        if (now - right_last_rise) <= DOUBLE_PRESS_GAP:
-            begin_twirl(left=False)
-        else:
-            right_press_start = now
-        right_last_rise = now
-        right_pressed = True
-
-    if right_now and right_pressed:
-        if mode in (MODE_IDLE, MODE_SINGLE_LEFT, MODE_SINGLE_RIGHT):
-            if (now - right_press_start) >= LONG_PRESS_TIME and mode != MODE_SINGLE_RIGHT:
-                mode = MODE_SINGLE_RIGHT
-                #ramp_motor(target_rpm=300)
-                print("Single RIGHT started")
-
-    if not right_now and right_pressed:
-        if mode == MODE_SINGLE_RIGHT:
-            safe_stop()
-            mode = MODE_IDLE
-            print("Single RIGHT stopped")
-        right_pressed = False
-
-# ---------- Drive ----------
-def periodic_drive(now):
-    global last_send_time, base_rpm
-    if (now - last_send_time) < SEND_PERIOD:
+    # Ensure timely update
+    if (now - state.last_send_time) < state.SEND_PERIOD:
         return
-    last_send_time = now
+    state.last_send_time = now
 
     try:
+        throttle_value = throttle_channel.value
+        base_rpm = adc_to_rpm(throttle_value)
+
+        mode = state.mode
+        current_direction = state.current_direction
+
+        # ---------------- Mode Handling ----------------
+        if mode == state.MODE_SINGLE_LEFT:
+            target_left = base_rpm
+            target_right = state.SINGLE_LEFT_LOW  
+
+        elif mode == state.MODE_SINGLE_RIGHT:
+            target_left = state.SINGLE_RIGHT_LOW  
+            target_right = base_rpm
+
+        else:
+            # Dead zone check 
+            if base_rpm < 120:  # threshold
+                motor_manager.set_wheels(0, 0, current_direction)
+                state.current_rpm = 0
+                state.last_left_rpm = 0
+                state.last_right_rpm = 0
+                return
+
+            target_left = target_right = base_rpm
+            state.current_rpm = base_rpm
+
+        # ---------------- Gradient Limiter ----------------
+        def apply_gradient(target, current, slew_rate):
         
-        throttle_value = throttle_channel.value
-        base_rpm = adc_to_rpm(throttle_value)
-        # --------- Long press modes (ignore feedback + throttle) ---------
-        if mode == MODE_SINGLE_LEFT:
-            send_motor_rpm_with_dir(base_rpm, 0, current_direction)
-            return
-        elif mode == MODE_SINGLE_RIGHT:
-            send_motor_rpm_with_dir(0, base_rpm, current_direction)
-            return
+            if target < current and (current - target) > (3 * slew_rate):
+                return max(target, current - (3 * slew_rate))  # faster decay
+            
+            if target > current + slew_rate:
+                return current + slew_rate
+            elif target < current - slew_rate:
+                return current - slew_rate
+            else:
+                return target
 
-        # --------- Normal throttle mode (with feedback) ---------
-        throttle_value = throttle_channel.value
-        base_rpm = adc_to_rpm(throttle_value)
+        rpm_left = apply_gradient(target_left, state.last_left_rpm, RPM_SLEW_RATE)
+        rpm_right = apply_gradient(target_right, state.last_right_rpm, RPM_SLEW_RATE)
 
-        if base_rpm < 50:  # Dead zone
-            safe_stop()
-            return
+        # Apply motor command
+        motor_manager.set_wheels(rpm_left, rpm_right, current_direction)
 
-        # Start with equal RPMs (open-loop)
-        rpm_left = base_rpm
-        rpm_right = base_rpm
-
-        # -------- Feedback correction --------
-        if base_rpm >= LOW_RPM_FEEDBACK_OFF:
-            diff = feedbackRPM_Left - feedbackRPM_Right
-            if abs(diff) > FEEDBACK_TOLERANCE:
-                correction = int(0.1 * diff)
-                if diff > 0:
-                    rpm_left = max(0, rpm_left - correction)
-                elif diff < 0:
-                    rpm_right = max(0, rpm_right + correction)
-
-        send_motor_rpm_with_dir(rpm_left, rpm_right, current_direction)
+        # Save for next cycle
+        state.last_left_rpm = rpm_left
+        state.last_right_rpm = rpm_right
 
     except Exception as e:
         print(f"Throttle/feedback drive failed: {e}")
-        safe_stop()
+        safe_stop(motor_manager)
 
-# ---------- Rotary ----------
-def rotary_motor_step():
-    
+def handle_button_edges(now, motor_manager):
+    """Detect button presses and update mode safely with shared state."""
+
+    # -------- LEFT BUTTON --------
+    left_now = GPIO.input(state.LEFT_BTN_PIN) == GPIO.HIGH
+
+    left_pressed = state.left_pressed
+    left_press_start = state.left_press_start
+    left_last_rise = state.left_last_rise
+    mode = state.mode
+
+    if left_now and not left_pressed:  # Rising edge
+        if (now - left_last_rise) <= state.DOUBLE_PRESS_GAP:
+            begin_twirl(left=True)
+        else:
+            state.left_press_start = now
+        state.left_last_rise = now
+        state.left_pressed = True
+
+    if left_now and left_pressed:
+        if mode in (state.MODE_IDLE, state.MODE_SINGLE_LEFT, state.MODE_SINGLE_RIGHT):
+            if (now - left_press_start) >= state.LONG_PRESS_TIME and mode != state.MODE_SINGLE_LEFT:
+                state.mode = state.MODE_SINGLE_LEFT
+                print("Single LEFT started")
+
+    if not left_now and left_pressed:  # Release
+        if mode == state.MODE_SINGLE_LEFT:
+            #safe_stop(motor_manager)
+            state.mode = state.MODE_IDLE
+            print("Single LEFT stopped")
+        state.left_pressed = False
+
+    # -------- RIGHT BUTTON --------
+    right_now = GPIO.input(state.RIGHT_BTN_PIN) == GPIO.HIGH
+
+    right_pressed = state.right_pressed
+    right_press_start = state.right_press_start
+    right_last_rise = state.right_last_rise
+    mode = state.mode
+
+    if right_now and not right_pressed:
+        if (now - right_last_rise) <= state.DOUBLE_PRESS_GAP:
+            begin_twirl(left=False)
+        else:
+            state.right_press_start = now
+        state.right_last_rise = now
+        state.right_pressed = True
+
+    if right_now and right_pressed:
+        if mode in (state.MODE_IDLE, state.MODE_SINGLE_LEFT, state.MODE_SINGLE_RIGHT):
+            if (now - right_press_start) >= state.LONG_PRESS_TIME and mode != state.MODE_SINGLE_RIGHT:
+                state.mode = state.MODE_SINGLE_RIGHT
+                print("Single RIGHT started")
+
+    if not right_now and right_pressed:  # Release
+        if mode == state.MODE_SINGLE_RIGHT:
+            #safe_stop(motor_manager)
+            state.mode = state.MODE_IDLE
+            print("Single RIGHT stopped")
+        state.right_pressed = False
+
+def rotary_motor_step(motor_manager):
     """Runs a single step of rotary motor logic (independent of drive motors)."""
-    if GPIO.input(MODE_SWITCH_PIN) == GPIO.LOW:
-        rotary_motor_stop()
-        return
-
-    if GPIO.input(ROTARY_SWITCH_PIN) == GPIO.LOW:
-        rotary_motor_stop()
+ # ?? Protect shared state
+        # Stop rotary motor if switch is OFF
+    if GPIO.input(state.ROTARY_SWITCH_PIN) == GPIO.LOW:
+        rotary_motor_stop(motor_manager)
+        state.rotary_current_rpm = 0
         return
 
     try:
         throttle_value = rotary_throttle_channel.value
         throttle_rpm = adc_to_rpm(throttle_value)
-        if throttle_rpm > 50:  # Dead zone
-            send_rotary_motor_rpm(throttle_rpm, current_direction)
-            print("send RPM ", throttle_rpm)
+        state.rotary_current_rpm = throttle_rpm
+        if throttle_rpm > 80:  # Dead zone filter
+            motor_manager.set_rotary(throttle_rpm, state.current_direction)
         else:
-            rotary_motor_stop()
+            rotary_motor_stop(motor_manager)
+            state.rotary_current_rpm = 0
+
     except Exception as e:
         print(f"Rotary throttle read failed: {e}")
-        rotary_motor_stop()
+        rotary_motor_stop(motor_manager)
 
-# ---------- MAIN STEP ----------
-def on_road_mode_step():
+def rotary_motor_stop(motor_manager):
+    """Hard stop rotary motor."""
+    try:
+        motor_manager.set_rotary(0, 0x00)
+        state.is_safe_stop = True
+    except Exception as e:
+        print("Error setting rotary stop:", e)
+
+def run(motor_manager):
+    """Run rotary + wheels at fixed RPM (test/demo)."""
+    try:
+        motor_manager.set_rotary(500, state.current_direction)
+        motor_manager.set_wheels(500, 500, state.current_direction)
+        state.is_safe_stop = False
+    except Exception as e:
+        print("Error running motors:", e)
+
+
+def safe_stop(motor_manager):
+    """Gradually stop rotary + wheels using gradient."""
+
+    try:
+        RPM_SLEW_RATE = 250  # same as periodic_drive
+
+        def apply_gradient(target, current, slew_rate):
+            if target > current + slew_rate:
+                return current + slew_rate
+            elif target < current - slew_rate:
+                return current - slew_rate
+            else:
+                return target
+
+        # ---- Wheels ----
+        rpm_left = apply_gradient(0, state.last_left_rpm, RPM_SLEW_RATE)
+        rpm_right = apply_gradient(0, state.last_right_rpm, RPM_SLEW_RATE)
+        motor_manager.set_wheels(rpm_left, rpm_right, 0x00)
+
+        # ---- Rotary ----
+        rotary_rpm = apply_gradient(0, state.rotary_current_rpm, RPM_SLEW_RATE)
+        motor_manager.set_rotary(rotary_rpm, 0x00)
+
+        # Save updated values
+        state.last_left_rpm = rpm_left
+        state.last_right_rpm = rpm_right
+        state.rotary_current_rpm = rotary_rpm
+        state.current_rpm = 0
+        state.is_safe_stop = True
+
+    except Exception as e:
+        print("Error during safe_stop:", e)
+
+def wheel_break_stop(motor_manager):
+    """Gradually stop both motors using gradient."""
+    try:
+        motor_manager.set_wheels_break(rpm_left, rpm_right, 0x00)
+        # Save new state
+        state.last_left_rpm = rpm_left
+        state.last_right_rpm = rpm_right
+        state.is_safe_stop = True
+
+    except Exception as e:
+        print("Error setting safe_stop:", e)
+
+
+def wheel_safe_stop(motor_manager):
+    """Gradually stop both motors using gradient."""
+    try:
+        RPM_SLEW_RATE = 250  # same slew rate as periodic_drive
+
+        def apply_gradient(target, current, slew_rate):
+            if target > current + slew_rate:
+                return current + slew_rate
+            elif target < current - slew_rate:
+                return current - slew_rate
+            else:
+                return target
+
+        # Ramp both wheels toward 0
+        rpm_left = apply_gradient(0, state.last_left_rpm, RPM_SLEW_RATE)
+        rpm_right = apply_gradient(0, state.last_right_rpm, RPM_SLEW_RATE)
+
+        motor_manager.set_wheels(rpm_left, rpm_right, 0x00)
+
+        # Save new state
+        state.last_left_rpm = rpm_left
+        state.last_right_rpm = rpm_right
+        state.is_safe_stop = True
+
+    except Exception as e:
+        print("Error setting safe_stop:", e)
+
+
+def ramp_wheel_rpm(motor_manager, target_rpm, direction, step=50, delay=0.05):
+    """
+    Smoothly ramp both wheels to the target RPM in the given direction.
+    Uses global state.current_rpm and state_lock for thread safety.
+    """
+    rpm = state.current_rpm
+
+    while rpm != target_rpm:
+        if rpm < target_rpm:
+            rpm = min(rpm + step, target_rpm)
+        else:
+            rpm = max(rpm - step, target_rpm)
+
+        print("Ramping wheels to", rpm)
+        try:
+            motor_manager.set_wheels(rpm, rpm, direction)
+        except Exception as e:
+            print("Error setting wheels during ramp:", e)
+            break
+
+        state.current_rpm = rpm
+        time.sleep(delay)
+
+def toggle_direction(motor_manager, desired_rpm=0, step=100, delay=0.05, safety_pause=0.2):
+    """
+    Smoothly change wheel direction without jerks.
+    Runs in a separate thread to avoid blocking the main loop.
+    """
+
+    def _toggle():
+        # --- Ramp down first ---
+
+        current_dir = state.current_direction
+        rpm = state.current_rpm
+
+        print("Ramping down before direction change...")
+        ramp_wheel_rpm(motor_manager, 0, current_dir, step=step, delay=delay)
+        time.sleep(safety_pause)
+
+        # --- Switch direction ---
+        state.current_direction = 0x02 if state.current_direction == 0x01 else 0x01
+        new_dir = state.current_direction
+        print("Direction set to", "REVERSE" if new_dir == 0x02 else "FORWARD")
+
+        # --- Ramp back up ---
+        if desired_rpm > 0:
+            print(f"Ramping up to {desired_rpm} rpm in new direction...")
+            ramp_wheel_rpm(motor_manager, desired_rpm, new_dir, step=step, delay=delay)
+
+    threading.Thread(target=_toggle, daemon=True).start()
+
+def on_road_mode_step(motor_manager):
+
     """
     Runs a single non-blocking step of On-Road logic.
-    This should be called repeatedly from main().
+    Should be called repeatedly from main().
     """
     now = time.monotonic()
 
+    # ---------- Handle Button Presses ----------
+    handle_button_edges(now, motor_manager)
+
     # ---------- DUAL BUTTON SAFETY ----------
-    left_b = GPIO.input(LEFT_BTN_PIN) == GPIO.HIGH
-    right_b = GPIO.input(RIGHT_BTN_PIN) == GPIO.HIGH
+    left_b = GPIO.input(state.LEFT_BTN_PIN) == GPIO.HIGH
+    right_b = GPIO.input(state.RIGHT_BTN_PIN) == GPIO.HIGH
 
     if left_b and right_b:
-        safe_stop()
-        global mode
-        mode = MODE_IDLE
+        safe_stop(motor_manager)
+        state.mode = state.MODE_IDLE
         return
-
+                    
     # ---------- Direction Button Handling ----------
-    global direction_btn_last_state, current_direction
-    direction_now = GPIO.input(DIRECTION_BTN_PIN) == GPIO.HIGH
-    if direction_now != direction_btn_last_state:   # detect ANY change
-        toggle_direction()
-    direction_btn_last_state = direction_now
 
-    # ---------- Handle Button Presses ----------
-    handle_button_edges(now)
+    last_dir_btn_state = state.direction_btn_last_state
 
+    # ---------- Read throttle ----------
+    try:
+        throttle_value = throttle_channel.value
+        base_rpm = adc_to_rpm(throttle_value)
+    except Exception as e:
+        print(f"Throttle read failed: {e}")
+        base_rpm = 0
+
+    #state.current_rpm = base_rpm
+    current_rpm = base_rpm
+
+    # ---------- Read direction button ----------
+    direction_now = GPIO.input(state.DIRECTION_BTN_PIN) == GPIO.HIGH
+
+    # ---------- Detect change ----------
+    if direction_now != last_dir_btn_state:
+        toggle_direction(
+            motor_manager,
+            desired_rpm=current_rpm,
+            step=70,
+            delay=0.03,
+            safety_pause=0.3,
+        )
+    # ---------- Update last state ----------
+    state.direction_btn_last_state = direction_now
     # ---------- Twirl Mode Execution ----------
-    if mode in (MODE_TWIRL_LEFT, MODE_TWIRL_RIGHT):
-        execute_twirl(now)
+    current_mode = state.mode
+
+    if current_mode in (state.MODE_TWIRL_LEFT, state.MODE_TWIRL_RIGHT):
+        execute_twirl(now, motor_manager)
+        pass
     else:
-        periodic_drive(now)
-        rotary_motor_step()
-        read_feedback()
+
+        #motor_manager.set_wheels(100, 120, 0x01)
+
+        periodic_drive(now, motor_manager)
+        rotary_motor_step(motor_manager)
+
+    # Small loop delay
+    time.sleep(0.01)
 

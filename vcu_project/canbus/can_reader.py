@@ -81,7 +81,7 @@ def send_request(bus, can_id):
     except can.CanError as e:
         print(f"Error sending request: {e}")
 
-def save_to_csv(decoded):
+'''def save_to_csv(decoded):
     decoded["timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     file_exists = os.path.isfile(CSV_FILE)
 
@@ -89,7 +89,7 @@ def save_to_csv(decoded):
         writer = csv.DictWriter(file, fieldnames=FIELDNAMES)
         if not file_exists:
             writer.writeheader()
-        writer.writerow(decoded)
+        writer.writerow(decoded)'''
 
 def manual_decode(message):
     global battery_voltage, current, soc
@@ -102,7 +102,6 @@ def manual_decode(message):
     global cell_balance_states
     global failure_status
     global decoded_full
-
     data = message.data
 
     if decoded_full["id"] is None:
@@ -171,7 +170,7 @@ def manual_decode(message):
         decoded_full["Reserved_7_0x12344001"] = Reserved_7_0x12344001
         print(No_of_btty_string, No_of_Tempe, Charger_status)
         
-#--------------------------------------------------------------------------------------
+
     elif message.arbitration_id in [0x12354001, 0x12354002]:
         frame_number = data[0]  # Frame number, starts from 0; 0xFF invalid
 
@@ -219,7 +218,6 @@ def manual_decode(message):
         decoded_full["frame_number"] = frame_number
         decoded_full["monomer_voltages"] = monomer_voltages
         decoded_full["reserved_7_0x12354001"] = reserved_7_0x12354001
-
 
 #--------------------------------------------------------------------------------------
     elif message.arbitration_id in [0x12364001, 0x12364001]:

@@ -3,8 +3,8 @@ import can
 import time
 
 # Settings
-MAX_RPM = 3000
-TEST_RPM = 1200  # Test RPM
+MAX_RPM = 1000
+TEST_RPM = 500  # Test RPM
 motor_ids = [4, 5, 6]  # Motor IDs to test
 SEND_INTERVAL = 2  # seconds between each motor test
 

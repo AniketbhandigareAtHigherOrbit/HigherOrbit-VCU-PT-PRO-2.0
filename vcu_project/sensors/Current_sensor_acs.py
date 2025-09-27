@@ -1,0 +1,27 @@
+import time
+import board
+import busio
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+
+# I2C bus
+i2c = busio.I2C(board.SCL, board.SDA)
+
+# Create ADS1115 object
+ads = ADS.ADS1115(i2c)
+ads.gain = 1   # 4.096V range (suitable for ACS712 output 0-5V, though 5V will clip slightly)
+
+# Use channel 0 (A0)
+chan = AnalogIn(ads, ADS.P2)
+
+# ACS712 parameters
+VCC = 5.0                # sensor powered from 5V
+OFFSET = VCC / 2         # ~2.5V at 0A
+SENSITIVITY = 0.100      # 100 mV/A (for ACS712 20A version)
+# For 5A ? 0.185, for 30A ? 0.066
+
+while True:
+    voltage = chan.voltage
+    current = (voltage - OFFSET) / SENSITIVITY
+    print(f"Voltage: {voltage:.3f} V, Current: {current:.3f} A")
+    time.sleep(0.5)
