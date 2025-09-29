@@ -100,7 +100,7 @@ def main():
         print("CAN interface initialized.\n")
 
         while True:
-            send_request(bus)
+            #send_request(bus)
             time.sleep(0.01)
             receive_response(bus)
             time.sleep(0.01)
