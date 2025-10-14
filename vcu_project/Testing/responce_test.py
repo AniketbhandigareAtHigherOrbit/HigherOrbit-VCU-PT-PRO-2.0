@@ -18,11 +18,11 @@ from datetime import datetime
 MOTOR_IDS = [4, 5, 6]        # motors to test
 MAX_RPM = 1000
 TEST_RPM = 500
-TEST_DURATION = 60           # total test time in seconds
-LOG_FILE = "controller_response_latency_threads.csv"
+TEST_DURATION = 320           # total test time in seconds
+LOG_FILE = "controller_response_latency_threads_1.csv"
 CAN_CHANNEL = "can0"
 CAN_BUSTYPE = "socketcan"
-TX_TIMEOUT = 2.0             # seconds to wait for feedback before considering timeout
+TX_TIMEOUT = 5.0             # seconds to wait for feedback before considering timeout
 TX_SLEEP_BETWEEN = 0.1       # small delay between motor commands in TX loop
 # ----------------------------------------
 
